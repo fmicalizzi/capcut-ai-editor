@@ -127,8 +127,8 @@ async def smart_cut_project(
 
     threshold_us = int(silence_threshold_sec * MICROSECONDS_PER_SECOND)
 
-    # Step 1: Find gaps (silences between subtitles)
-    gap_ranges = find_gaps(subtitles, threshold_us)
+    # Step 1: Find gaps (silences between subtitles, including start/end)
+    gap_ranges = find_gaps(subtitles, threshold_us, project.duration_us)
 
     # Step 2: Find duplicate takes
     duplicate_ranges = find_duplicate_takes(subtitles, similarity_threshold)
@@ -241,20 +241,41 @@ def compute_text_similarity(text_a: str, text_b: str) -> float:
 def find_gaps(
     subtitles: list[CapCutSubtitleSegment],
     threshold_us: int,
+    project_duration_us: int = 0,
 ) -> list[tuple[int, int]]:
     """
-    Find gaps between consecutive subtitle segments that exceed the threshold.
+    Find silence gaps that exceed the threshold.
 
-    A gap is the silence between one subtitle ending and the next beginning.
-    Only gaps BETWEEN subtitles are detected (not before first or after last).
+    Checks:
+    - Gap from project start (0) to first subtitle
+    - Gaps between consecutive subtitles
+    - Gap from last subtitle to project end
     """
     gaps = []
+
+    if not subtitles:
+        return gaps
+
+    # Gap at the beginning (before first subtitle)
+    first_start = subtitles[0].timeline_start_us
+    if first_start > threshold_us:
+        gaps.append((0, first_start))
+
+    # Gaps between consecutive subtitles
     for i in range(len(subtitles) - 1):
         current_end = subtitles[i].timeline_end_us
         next_start = subtitles[i + 1].timeline_start_us
         gap = next_start - current_end
         if gap > threshold_us:
             gaps.append((current_end, next_start))
+
+    # Gap at the end (after last subtitle)
+    if project_duration_us > 0:
+        last_end = subtitles[-1].timeline_end_us
+        tail_gap = project_duration_us - last_end
+        if tail_gap > threshold_us:
+            gaps.append((last_end, project_duration_us))
+
     return gaps
 
 
@@ -263,43 +284,46 @@ def find_duplicate_takes(
     similarity_threshold: float = DUPLICATE_SIMILARITY_THRESHOLD,
 ) -> list[tuple[int, int]]:
     """
-    Find duplicate takes by comparing consecutive subtitle texts.
+    Find duplicate takes by detecting "restart points".
 
-    When a person restarts a phrase, consecutive segments will have
-    high text similarity. We keep the LAST take in each group and
-    mark earlier ones for removal.
+    A person records in takes: they say a sequence of phrases, then start over.
+    Example:
+        "Hello friends today I'll..."   ← Take 1 (abandoned)
+        "Hello friends, today I'll show you..."  ← Take 2 (abandoned)
+        "Hello friends, today I'll show you how..."  ← Take 3 (KEEP)
 
-    Returns time ranges to cut (each earlier duplicate's full span).
+    The takes are NOT consecutive — each take is a GROUP of subtitles.
+    We detect restarts by finding subtitle[i] that matches an earlier subtitle[j],
+    meaning the speaker went back to re-record from that point.
+
+    Algorithm: walk through subtitles. For each one, check if any LATER subtitle
+    matches it (= speaker restarts from this phrase). If so, everything from
+    current position to just before the restart is an earlier take → cut it.
+
+    Returns time ranges of earlier takes to cut.
     """
     if len(subtitles) < 2:
         return []
 
-    # Build groups of consecutive similar segments
-    groups: list[list[int]] = []
-    current_group = [0]
-
-    for i in range(1, len(subtitles)):
-        similarity = compute_text_similarity(
-            subtitles[i - 1].text,
-            subtitles[i].text,
-        )
-        if similarity >= similarity_threshold:
-            current_group.append(i)
-        else:
-            if len(current_group) > 1:
-                groups.append(current_group)
-            current_group = [i]
-
-    if len(current_group) > 1:
-        groups.append(current_group)
-
-    # For each group, mark all but the last for removal
     ranges_to_cut = []
-    for group in groups:
-        to_remove = group[:-1]
-        for idx in to_remove:
-            seg = subtitles[idx]
-            ranges_to_cut.append((seg.timeline_start_us, seg.timeline_end_us))
+    i = 0
+
+    while i < len(subtitles):
+        # Look for the LATEST restart of this subtitle's phrase
+        # (if the speaker tried 3 times, we want the last one)
+        last_restart = None
+        for j in range(i + 1, len(subtitles)):
+            if compute_text_similarity(subtitles[i].text, subtitles[j].text) >= similarity_threshold:
+                last_restart = j
+
+        if last_restart is not None:
+            # Everything from i to last_restart-1 is earlier takes → cut
+            for k in range(i, last_restart):
+                seg = subtitles[k]
+                ranges_to_cut.append((seg.timeline_start_us, seg.timeline_end_us))
+            i = last_restart
+        else:
+            i += 1
 
     return ranges_to_cut
 
